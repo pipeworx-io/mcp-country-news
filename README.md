@@ -2,7 +2,7 @@
 
 Ranked top news headlines for any country, right now, via Google News RSS. The value over a raw news firehose is ranking: results come back in Google News' editorial-prominence order, so "latest news about China today" returns the day's top stories rather than thousands of unranked articles.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1663+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1679+ live data sources.
 
 ## Tools
 
@@ -64,7 +64,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1663+ data sources. The
+Both URLs reach the same gateway and the same 1679+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
