@@ -295,10 +295,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -943,28 +959,80 @@ const MAX_ITEMS = 50;
 
 const TOPICS = new Set(['WORLD', 'NATION', 'BUSINESS', 'TECHNOLOGY', 'ENTERTAINMENT', 'SPORTS', 'SCIENCE', 'HEALTH']);
 
-// Common-name → ISO2. Agents pass country names as often as codes; resolve
-// forgivingly instead of erroring (mcp-builder high-yield fix class #1).
-const COUNTRY_NAMES: Record<string, string> = {
-  'united states': 'US', usa: 'US', america: 'US', 'united kingdom': 'GB', uk: 'GB', britain: 'GB', england: 'GB',
-  china: 'CN', india: 'IN', japan: 'JP', germany: 'DE', france: 'FR', italy: 'IT', spain: 'ES', portugal: 'PT',
-  netherlands: 'NL', belgium: 'BE', switzerland: 'CH', austria: 'AT', sweden: 'SE', norway: 'NO', denmark: 'DK',
-  finland: 'FI', poland: 'PL', ukraine: 'UA', russia: 'RU', turkey: 'TR', greece: 'GR', ireland: 'IE',
-  canada: 'CA', mexico: 'MX', brazil: 'BR', argentina: 'AR', chile: 'CL', colombia: 'CO', peru: 'PE',
-  venezuela: 'VE', australia: 'AU', 'new zealand': 'NZ', 'south korea': 'KR', korea: 'KR', 'north korea': 'KP',
-  taiwan: 'TW', 'hong kong': 'HK', singapore: 'SG', malaysia: 'MY', indonesia: 'ID', thailand: 'TH',
-  vietnam: 'VN', philippines: 'PH', pakistan: 'PK', bangladesh: 'BD', 'sri lanka': 'LK', nepal: 'NP',
-  israel: 'IL', 'saudi arabia': 'SA', uae: 'AE', 'united arab emirates': 'AE', qatar: 'QA', kuwait: 'KW',
-  iran: 'IR', iraq: 'IQ', egypt: 'EG', jordan: 'JO', lebanon: 'LB', 'south africa': 'ZA', nigeria: 'NG',
-  kenya: 'KE', ethiopia: 'ET', ghana: 'GH', morocco: 'MA', algeria: 'DZ', tunisia: 'TN', tanzania: 'TZ',
-  uganda: 'UG', zimbabwe: 'ZW', czechia: 'CZ', 'czech republic': 'CZ', slovakia: 'SK', hungary: 'HU',
-  romania: 'RO', bulgaria: 'BG', croatia: 'HR', serbia: 'RS', slovenia: 'SI', estonia: 'EE', latvia: 'LV',
-  lithuania: 'LT', iceland: 'IS', luxembourg: 'LU', malta: 'MT', cyprus: 'CY', georgia: 'GE', armenia: 'AM',
-  azerbaijan: 'AZ', kazakhstan: 'KZ', uzbekistan: 'UZ', mongolia: 'MN', myanmar: 'MM', cambodia: 'KH',
-  laos: 'LA', afghanistan: 'AF', cuba: 'CU', 'dominican republic': 'DO', ecuador: 'EC', bolivia: 'BO',
-  uruguay: 'UY', paraguay: 'PY', panama: 'PA', 'costa rica': 'CR', guatemala: 'GT', honduras: 'HN',
-  nicaragua: 'NI', 'el salvador': 'SV', jamaica: 'JM', haiti: 'HT',
+// Country resolution (fleet #3409). The table used to be a hand-written map of
+// ~108 names; every country outside it was refused before any upstream call even
+// though Google News serves them. The ICU region-name data the runtime already
+// carries (Intl.DisplayNames) is the list now: zero baked bytes, and it follows
+// the standard instead of whoever last edited this file. Built lazily on the
+// first call, never at module scope (CLAUDE.md, fleet #2754).
+//
+// Only two small hand lists remain, both for things ICU cannot know:
+//  - ALIASES: what people SAY that is not CLDR's wording ("Ivory Coast", "UAE").
+//  - NOT_COUNTRIES: ICU also answers for deprecated ISO codes (AN, DD, SU...) and
+//    reserved non-countries (EU, UN, ZZ...). Both sets are frozen by ISO.
+const ALIASES: Record<string, string> = {
+  usa: 'US', america: 'US', 'united states of america': 'US', uk: 'GB', britain: 'GB', 'great britain': 'GB', england: 'GB',
+  scotland: 'GB', wales: 'GB', uae: 'AE', korea: 'KR', 'republic of korea': 'KR', 'czech republic': 'CZ',
+  'ivory coast': 'CI', turkey: 'TR', burma: 'MM', holland: 'NL', swaziland: 'SZ', macedonia: 'MK', 'east timor': 'TL',
+  'cape verde': 'CV', 'cabo verde': 'CV', vatican: 'VA', 'holy see': 'VA', palestine: 'PS', congo: 'CD', drc: 'CD',
+  'dr congo': 'CD', 'democratic republic of the congo': 'CD', 'republic of the congo': 'CG', 'congo brazzaville': 'CG',
+  'congo kinshasa': 'CD', russia: 'RU', 'russian federation': 'RU', vietnam: 'VN', 'viet nam': 'VN', syria: 'SY', iran: 'IR',
+  laos: 'LA', bolivia: 'BO', venezuela: 'VE', tanzania: 'TZ', moldova: 'MD', brunei: 'BN', taiwan: 'TW', 'the gambia': 'GM',
+  'the bahamas': 'BS', 'the netherlands': 'NL', 'the philippines': 'PH',
 };
+const NOT_COUNTRIES = new Set([
+  'AC', 'CP', 'CQ', 'DG', 'EA', 'EU', 'EZ', 'IC', 'TA', 'UN', 'XA', 'XB', 'QO', 'ZZ', // reserved / not a country
+  'AN', 'BU', 'CS', 'DD', 'FX', 'HV', 'NH', 'RH', 'SU', 'TP', 'VD', 'YD', 'YU', 'ZR', 'UK', // deprecated ISO codes
+]);
+
+interface CountryIndex { byCode: Map<string, string>; byName: Map<string, string> }
+let INDEX: CountryIndex | null | undefined;
+
+/** Lowercase, accent-free, "&"→"and", "st."→"saint", punctuation dropped. */
+function norm(s: string): string {
+  return s
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/&/g, ' and ').replace(/\bst\.?(?=\s)/g, 'saint').replace(/[’'.,()\-–]/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+
+/** The search term for a country: short CLDR name when there is one, else the long one, minus qualifiers that make a poor query. */
+function searchName(long: string, short: string | undefined): string {
+  const n = (short || long).replace(/\s+SAR China$/i, '').replace(/\s*\([^)]*\)\s*/g, ' ').replace(/&/g, 'and').trim();
+  if (/^Congo - Kinshasa$/i.test(long)) return 'DR Congo';
+  if (/^Congo - Brazzaville$/i.test(long)) return 'Republic of the Congo';
+  return n.replace(/\s+-\s+/g, ' ');
+}
+
+function buildIndex(): CountryIndex | null {
+  if (INDEX !== undefined) return INDEX;
+  INDEX = null;
+  try {
+    const long = new Intl.DisplayNames(['en'], { type: 'region', fallback: 'none' });
+    const short = new Intl.DisplayNames(['en'], { type: 'region', fallback: 'none', style: 'short' });
+    const byCode = new Map<string, string>();
+    const byName = new Map<string, string>();
+    for (let a = 65; a < 91; a++) {
+      for (let b = 65; b < 91; b++) {
+        const code = String.fromCharCode(a, b);
+        if (NOT_COUNTRIES.has(code)) continue;
+        const ln = long.of(code);
+        if (!ln || ln === code) continue;
+        const sn = short.of(code);
+        byCode.set(code, searchName(ln, sn && sn !== code ? sn : undefined));
+        for (const n of [ln, sn, ln.replace(/\s+SAR China$/i, ''), ln.replace(/\s*\([^)]*\)/, '')]) {
+          if (n && n !== code) byName.set(norm(n), code);
+        }
+        const paren = /\(([^)]+)\)/.exec(ln);
+        if (paren) byName.set(norm(paren[1]!), code);
+      }
+    }
+    if (byCode.size > 100) INDEX = { byCode, byName };
+  } catch {
+    /* runtime without region display names: resolve from ALIASES alone */
+  }
+  return INDEX;
+}
 
 const tools: McpToolExport['tools'] = [
   {
@@ -975,7 +1043,8 @@ const tools: McpToolExport['tools'] = [
       type: 'object',
       properties: {
         country: { type: 'string', description: 'Country name or ISO-2 code, e.g. "China", "DE", "Brazil".' },
-        topic: { type: 'string', description: 'Optional: read this section of the country\'s LOCAL Google News edition (news for readers there): WORLD | NATION | BUSINESS | TECHNOLOGY | ENTERTAINMENT | SPORTS | SCIENCE | HEALTH.' },
+        topic: { type: 'string', description: 'Optional: read this section of the country\'s LOCAL Google News edition (news for readers there): WORLD | NATION | BUSINESS | TECHNOLOGY | ENTERTAINMENT | SPORTS | SCIENCE | HEALTH. The edition is served in the country\'s own language, derived from the region (Germany -> German headlines, China -> Chinese, France -> French, Japan -> Japanese, Mexico -> Spanish); the response says which `language` was used. A country with no distinct edition in any language returns found:false reason no_local_edition rather than another country\'s stories (omit topic to get English news about any country).' },
+        language: { type: 'string', description: 'Optional, topic mode only: force the edition language as a primary language code ("fr", "de", "en", "zh"). Needed for multilingual countries where the derived default is only one of several: Switzerland defaults to German, Belgium to Dutch, Canada to English, India to English. Ignored without `topic`.' },
         query: { type: 'string', description: 'Optional keyword combined with the country in the search, e.g. "election", "floods".' },
         days: { type: 'number', description: 'Search window: only items from the last N days (default 2).' },
         limit: { type: 'number', description: 'Max items (1-50, default 20).' },
@@ -987,21 +1056,20 @@ const tools: McpToolExport['tools'] = [
 
 function resolveCountry(raw: string): { iso: string; name: string } {
   const v = raw.trim();
+  const idx = buildIndex();
   if (/^[A-Za-z]{2}$/.test(v)) {
-    const iso = v.toUpperCase() === 'UK' ? 'GB' : v.toUpperCase();
-    return { iso, name: isoToName(iso) ?? iso };
+    let iso = v.toUpperCase();
+    if (iso === 'UK') iso = 'GB';
+    // With the index, a two-letter string that is not an assigned country code
+    // ("ZZ", "AN") is refused; without it, any pair is passed through as before.
+    if (!idx || idx.byCode.has(iso)) return { iso, name: idx?.byCode.get(iso) ?? iso };
+  } else {
+    const key = norm(v);
+    const iso = ALIASES[key] ?? idx?.byName.get(key) ?? idx?.byName.get(key.replace(/^the /, ''));
+    if (iso) return { iso, name: idx?.byCode.get(iso) ?? v };
   }
-  const iso = COUNTRY_NAMES[v.toLowerCase()];
-  if (iso) return { iso, name: isoToName(iso) ?? v };
-  throw new Error(`user_error: Unrecognized country "${raw}". Pass an ISO-2 code (e.g. "CN", "DE") or a common English country name.`);
-}
-
-// First name listed for an ISO code is its canonical search term.
-function isoToName(iso: string): string | null {
-  for (const [name, code] of Object.entries(COUNTRY_NAMES)) {
-    if (code === iso) return name.replace(/\b[a-z]/g, (c) => c.toUpperCase());
-  }
-  return null;
+  const near = idx ? [...idx.byCode.entries()].filter(([, n]) => norm(n).startsWith(norm(v).slice(0, 3)) && norm(v).length >= 3).slice(0, 4).map(([c, n]) => `${n} (${c})`) : [];
+  throw new Error(`user_error: Unrecognized country "${raw}". Pass an ISO-2 code (e.g. "CN", "DE") or an English country name.${near.length ? ` Did you mean: ${near.join(', ')}?` : ''}`);
 }
 
 async function countryNews(args: Record<string, unknown>): Promise<unknown> {
@@ -1022,8 +1090,10 @@ async function countryNews(args: Record<string, unknown>): Promise<unknown> {
   // with gl=CN) — so the edition is only used for explicit `topic` reads.
   let url: string;
   let mode: string;
+  let edition: Edition | null = null;
   if (topicRaw) {
-    url = `https://news.google.com/rss/headlines/section/topic/${topicRaw}?gl=${iso}&hl=en-US&ceid=${iso}:en`;
+    edition = pickEdition(iso, typeof args.language === 'string' ? args.language : '');
+    url = topicUrl(topicRaw, iso, edition);
     mode = `local_edition_topic:${topicRaw.toLowerCase()}`;
   } else {
     const terms = q ? `${name} ${q}` : name;
@@ -1031,7 +1101,37 @@ async function countryNews(args: Record<string, unknown>): Promise<unknown> {
     mode = q ? 'search' : 'about_country';
   }
 
-  const { items, via } = await getFeed(url);
+  let { items, via } = await getFeed(url);
+  let editionCheck: EditionCheck | undefined;
+  let fellBackFrom: string | undefined;
+  if (topicRaw) {
+    // Judge the edition we asked for. A DERIVED non-English edition that does not
+    // exist (empty, or Google served a generic feed) falls back to the English
+    // edition -- what this tool served before -- and is judged again, so a
+    // country is only refused when NEITHER exists. An explicit `language` is
+    // never silently swapped for another one.
+    let verdict = items.length ? await judgeEdition(iso, topicRaw, items, edition) : null;
+    if ((!items.length || verdict?.substituted) && edition && edition.source !== 'override') {
+      fellBackFrom = edition.lang;
+      edition = null;
+      url = topicUrl(topicRaw, iso, null);
+      ({ items, via } = await getFeed(url));
+      verdict = items.length ? await judgeEdition(iso, topicRaw, items, null) : null;
+    }
+    editionCheck = verdict ?? undefined;
+    if (editionCheck?.substituted) {
+      return {
+        found: false,
+        reason: 'no_local_edition',
+        country: iso,
+        country_name: name,
+        mode,
+        edition_check: editionCheck,
+        message: `Google News has no distinct ${name} edition of the ${topicRaw} section${edition ? ` in language "${edition.lang}"` : ''}: the feed it served for ${iso} is the same generic edition it serves for a country code that does not exist (${Math.round(editionCheck.overlap * 100)}% of headlines identical). Those stories are not ${name} news, so none are returned under that label.`,
+        hint: `Omit \`topic\` to get ranked news ABOUT ${name} (works for every country), or pass a country with its own edition.`,
+      };
+    }
+  }
   if (!items.length) {
     return { found: false, reason: 'no_items', country: iso, hint: 'Google News returned no items. Try a longer `days` window or a broader `query`.' };
   }
@@ -1041,9 +1141,171 @@ async function countryNews(args: Record<string, unknown>): Promise<unknown> {
     mode,
     ranked_by: 'Google News prominence (order preserved)',
     via,
+    ...(topicRaw ? { language: languageReport(edition, fellBackFrom) } : {}),
+    ...(editionCheck ? { edition_check: editionCheck } : {}),
     count: Math.min(items.length, limit),
     items: items.slice(0, limit).map((i, idx) => ({ rank: idx + 1, ...i })),
   };
+}
+
+// Edition language (fleet #3472). Google News serves a country's real local
+// edition only when asked in that edition's language (hl=de&ceid=DE:de); asking
+// for hl=en-US under gl=DE returns the generic English feed, which is why #3470
+// had to refuse Germany, China, France... The language is DERIVED from the region
+// by the runtime's own ICU likely-subtags data (Intl.Locale.maximize) -- no
+// per-country table. The only hand-written entry is below, for the one region
+// where ICU's single answer is the wrong default for news.
+//  - IN: ICU says Hindi; Google's Indian edition most callers want is English
+//    (India is 20+ languages; "hi" is reachable with language:"hi").
+// Other multilingual regions (CH de/fr/it, BE nl/fr, CA en/fr) take ICU's
+// plurality answer (de, nl, en) and are steerable with the `language` argument;
+// they need no entry of their own.
+const LANGUAGE_DEFAULTS: Record<string, string> = { IN: 'en' };
+
+interface Edition { lang: string; hl: string; ceidLang: string; source: 'derived' | 'explicit_list' | 'override' }
+
+function maximize(tag: string): { language: string; script?: string; region?: string } | null {
+  try {
+    const m = new Intl.Locale(tag).maximize();
+    return { language: m.language, script: m.script, region: m.region };
+  } catch {
+    return null;
+  }
+}
+
+/** The edition for a region, or null for English (served exactly as before). */
+function pickEdition(iso: string, override: string): Edition | null {
+  let lang = override.trim().toLowerCase().split(/[-_]/)[0] ?? '';
+  let source: Edition['source'] = 'override';
+  if (!lang) {
+    if (LANGUAGE_DEFAULTS[iso]) { lang = LANGUAGE_DEFAULTS[iso]!; source = 'explicit_list'; }
+    else { lang = maximize(`und-${iso}`)?.language ?? 'en'; source = 'derived'; }
+  }
+  if (!/^[a-z]{2,3}$/.test(lang)) throw new Error(`user_error: language "${override}" is not a language code. Pass a primary language such as "de", "fr", "zh", "en".`);
+  if (lang === 'nb' || lang === 'nn') lang = 'no';
+  if (lang === 'en') return null;
+  if (lang === 'zh') {
+    const script = maximize(`und-${iso}`)?.script;
+    // Google keys Chinese editions by script: CN = Simplified, TW/HK/MO = Traditional.
+    return script === 'Hant' || iso === 'TW' || iso === 'HK' || iso === 'MO'
+      ? { lang, hl: iso === 'TW' ? 'zh-TW' : 'zh-HK', ceidLang: 'zh-Hant', source }
+      : { lang, hl: 'zh-CN', ceidLang: 'zh-Hans', source };
+  }
+  return { lang, hl: lang, ceidLang: lang, source };
+}
+
+function topicUrl(topic: string, iso: string, ed: Edition | null): string {
+  return ed
+    ? `https://news.google.com/rss/headlines/section/topic/${topic}?gl=${iso}&hl=${ed.hl}&ceid=${iso}:${ed.ceidLang}`
+    : `https://news.google.com/rss/headlines/section/topic/${topic}?gl=${iso}&hl=en-US&ceid=${iso}:en`;
+}
+
+function languageReport(ed: Edition | null, fellBackFrom?: string) {
+  return {
+    code: ed?.lang ?? 'en',
+    hl: ed?.hl ?? 'en-US',
+    chosen_by: ed ? (ed.source === 'derived' ? 'derived from the country (ICU likely-subtags)' : ed.source === 'override' ? 'the `language` argument' : 'explicit list') : (fellBackFrom ? 'fallback' : 'english edition'),
+    ...(fellBackFrom ? { fell_back_from: fellBackFrom, note: `No distinct "${fellBackFrom}" edition exists for this country, so the English edition is served.` } : {}),
+    note_on_language: 'Headlines are in the language shown here, not translated.',
+  };
+}
+
+/**
+ * The #3470 detector (checkEdition, unchanged) compares against the English
+ * generic feed. A non-English edition needs one more test, because Google serves
+ * hl=de under an unknown gl as the German HOME edition (measured 2026-10-22:
+ * gl=BV&hl=de is 100% identical to gl=ZZ&hl=de, and both equal Germany's) -- which
+ * an English control cannot see. So a non-English edition is also compared to the
+ * generic feed in ITS language, and may match it only when the country IS that
+ * language's home region (DE for de, FR for fr, CN for zh, ES for es...).
+ */
+async function judgeEdition(iso: string, topic: string, items: NewsItem[], ed: Edition | null): Promise<EditionCheck> {
+  const base = await checkEdition(iso, topic, items);
+  if (!ed || base.substituted) return base;
+  const home = ed.lang === 'zh' ? ed.hl.split('-')[1] : maximize(ed.lang)?.region;
+  const lc = await langControl(topic, ed);
+  const keys = items.map(itemKey);
+  const hits = keys.filter((k) => lc.has(k)).length;
+  const compared = Math.min(keys.length, lc.size);
+  const overlap = compared ? hits / compared : 0;
+  // Google also answers an hl it has no edition for (hl=sw under gl=KE) with the
+  // country's ENGLISH edition. Labelling that "sw" would be a false statement, so
+  // compare with this country's English feed too: if it is the same stories, the
+  // requested language was not applied.
+  let enOverlap = 0;
+  try {
+    const en = await getFeed(topicUrl(topic, iso, null));
+    const enKeys = new Set(en.items.map(itemKey));
+    const c2 = Math.min(keys.length, enKeys.size);
+    enOverlap = c2 ? keys.filter((k) => enKeys.has(k)).length / c2 : 0;
+  } catch {
+    /* English edition unreachable: the generic-control checks above still stand */
+  }
+  const substituted = compared > 0 && ((overlap >= SUBSTITUTION_THRESHOLD && iso !== home) || enOverlap >= SUBSTITUTION_THRESHOLD);
+  return {
+    ...base,
+    english_edition_overlap: Math.round(enOverlap * 1000) / 1000,
+    language_control: `gl=ZZ hl=${ed.hl} (Google's generic feed in this language; legitimately identical only for ${home ?? 'its home region'})`,
+    language_control_overlap: Math.round(overlap * 1000) / 1000,
+    substituted,
+  } as EditionCheck;
+}
+
+const langControlCache = new Map<string, { at: number; keys: Set<string> }>();
+async function langControl(topic: string, ed: Edition): Promise<Set<string>> {
+  const k = `${topic}|${ed.hl}`;
+  let c = langControlCache.get(k);
+  if (!c || Date.now() - c.at > 10 * 60_000) {
+    let got: { items: NewsItem[] };
+    try {
+      got = await getFeed(`https://news.google.com/rss/headlines/section/topic/${topic}?gl=ZZ&hl=${ed.hl}&ceid=ZZ:${ed.ceidLang}`);
+    } catch {
+      throw new Error(`Could not verify that Google News has a distinct ${ed.lang}-language edition (the reference feed was unreachable), so no headlines are returned. Retry shortly, or omit \`topic\`.`);
+    }
+    c = { at: Date.now(), keys: new Set(got.items.map(itemKey)) };
+    langControlCache.set(k, c);
+  }
+  return c.keys;
+}
+
+interface EditionCheck { control: string; overlap: number; compared: number; substituted: boolean; language_control?: string; language_control_overlap?: number; english_edition_overlap?: number }
+
+/**
+ * Google ignores a gl= it has no edition for and serves a generic feed under it
+ * (fleet #3470: Bouvet Island BUSINESS came back as the same stories as DE).
+ * Instead of listing the countries that have an edition (a list that rots), ask
+ * for the same section under a country code that cannot exist (ZZ) -- that IS
+ * the generic edition, whatever it currently is -- and compare. Measured
+ * 2026-10-22: real editions overlap it 0-14% of headlines, substituted ones 100%.
+ * US is skipped: its edition and the generic one are the same feed by
+ * construction, so it can never be told apart (and is real).
+ */
+const SUBSTITUTION_THRESHOLD = 0.5;
+const controlCache = new Map<string, { at: number; keys: Set<string> }>();
+
+function itemKey(i: NewsItem): string {
+  return i.link || i.title;
+}
+
+async function checkEdition(iso: string, topic: string, items: NewsItem[]): Promise<EditionCheck> {
+  if (iso === 'US') return { control: 'n/a (US is the generic edition)', overlap: 0, compared: 0, substituted: false };
+  let ctl = controlCache.get(topic);
+  if (!ctl || Date.now() - ctl.at > 10 * 60_000) {
+    const url = `https://news.google.com/rss/headlines/section/topic/${topic}?gl=ZZ&hl=en-US&ceid=ZZ:en`;
+    let got: { items: NewsItem[] };
+    try {
+      got = await getFeed(url);
+    } catch {
+      throw new Error(`Could not verify that Google News has a distinct ${iso} edition (the reference feed was unreachable), so no ${topic} headlines are returned under that country label. Retry shortly, or omit \`topic\`.`);
+    }
+    ctl = { at: Date.now(), keys: new Set(got.items.map(itemKey)) };
+    controlCache.set(topic, ctl);
+  }
+  const keys = items.map(itemKey);
+  const hits = keys.filter((k) => ctl!.keys.has(k)).length;
+  const compared = Math.min(keys.length, ctl.keys.size);
+  const overlap = compared ? hits / compared : 0;
+  return { control: 'gl=ZZ (a country code Google has no edition for)', overlap: Math.round(overlap * 1000) / 1000, compared, substituted: compared > 0 && overlap >= SUBSTITUTION_THRESHOLD };
 }
 
 interface NewsItem { title: string; link: string; published?: string; publication?: string }
